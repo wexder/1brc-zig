@@ -7,7 +7,9 @@ const assert = std.debug.assert;
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    var arena = std.heap.ArenaAllocator.init(gpa.allocator());
+    defer arena.deinit();
+    const allocator = arena.allocator();
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
@@ -28,8 +30,8 @@ pub fn main() !void {
     var city_map = std.StringHashMap(City).init(allocator);
     defer city_map.deinit();
 
-    const buf = try allocator.alloc(u8, 4096 * 16);
-    defer allocator.free(buf);
+    // const buf = try allocator.alloc(u8, 4096 * 16);
+    // defer allocator.free(buf);
 
     // var last_n: u64 = 0;
     // while (true) : (line_no += 1) {
@@ -110,12 +112,6 @@ pub fn main() !void {
         const city = city_map.get(c) orelse continue;
         const count: f64 = @floatFromInt(city.count);
         print("{s} min: {d}, max: {d}, avg: {d}\n", .{ c, city.min, city.max, city.sum / count });
-    }
-
-    // cleanup
-    iter = city_map.keyIterator();
-    while (iter.next()) |k| {
-        allocator.free(k.*);
     }
 }
 

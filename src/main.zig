@@ -37,10 +37,8 @@ pub fn main() !void {
     var last_n: u64 = 0;
     for (mapped_mem, 0..) |b, i| {
         if (b == '\n') {
-            try parseLine(&ln, mapped_mem[last_n + 1 .. i]);
-            last_n = i;
-
-            const key = try allocator.dupe(u8, ln.name);
+            try parseLine(&ln, mapped_mem[last_n..i]);
+            const key = mapped_mem[last_n .. last_n + ln.name_length];
 
             const city = try city_map.getOrPut(key);
             if (city.found_existing) {
@@ -53,9 +51,8 @@ pub fn main() !void {
                     .count = 1,
                 };
             }
-            if (city.found_existing) {
-                defer allocator.free(key);
-            }
+
+            last_n = i + 1;
         }
     }
 
@@ -99,27 +96,20 @@ const City = struct {
 const Line = struct {
     const Self = @This();
 
-    name: []u8,
+    name_length: usize,
     temp: f64,
     allocator: std.mem.Allocator,
 
     fn init(allocator: std.mem.Allocator) !Line {
-        const name = try allocator.alloc(u8, 0);
         return Line{
-            .name = name,
+            .name_length = 0,
             .temp = 0,
             .allocator = allocator,
         };
     }
 
-    fn set_name(self: *Self, n: []const u8) !void {
-        const name = try self.allocator.realloc(self.name, n.len);
-        @memcpy(name, n);
-        self.name = name;
-    }
-
     fn deinit(self: Self) void {
-        self.allocator.free(self.name);
+        _ = self;
     }
 };
 
@@ -130,7 +120,7 @@ fn parseLine(ln: *Line, line: []const u8) !void {
     while (s.next()) |l| {
         switch (i) {
             0 => {
-                try ln.set_name(l);
+                ln.name_length = l.len;
             },
             1 => {
                 const temp = try simpleFloatParse(l);

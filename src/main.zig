@@ -13,16 +13,20 @@ pub fn main() !void {
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
-    const file = try fs.cwd().openFile(args[1], .{});
+    const file = try std.fs.cwd().openFile(args[1], .{ .mode = .read_only });
     defer file.close();
 
-    var buf_reader = std.io.bufferedReader(file.reader());
-    const reader = buf_reader.reader();
-
-    var line_no: usize = 1;
-    var line = std.ArrayList(u8).init(allocator);
-    defer line.deinit();
-    const writer = line.writer();
+    const file_len: usize = std.math.cast(usize, try file.getEndPos()) orelse std.math.maxInt(usize);
+    const mapped_mem = try std.os.mmap(
+        null,
+        file_len,
+        std.os.PROT.READ,
+        .{ .TYPE = .PRIVATE },
+        file.handle,
+        0,
+    );
+    defer std.os.munmap(mapped_mem);
+    try std.os.madvise(mapped_mem.ptr, file_len, std.os.MADV.HUGEPAGE);
 
     var ln = try Line.init(allocator);
     defer ln.deinit();
@@ -30,71 +34,29 @@ pub fn main() !void {
     var city_map = std.StringHashMap(City).init(allocator);
     defer city_map.deinit();
 
-    // const buf = try allocator.alloc(u8, 4096 * 16);
-    // defer allocator.free(buf);
+    var last_n: u64 = 0;
+    for (mapped_mem, 0..) |b, i| {
+        if (b == '\n') {
+            try parseLine(&ln, mapped_mem[last_n + 1 .. i]);
+            last_n = i;
 
-    // var last_n: u64 = 0;
-    // while (true) : (line_no += 1) {
-    //     last_n = 0;
-    //     if (reader.read(buf)) |n| {
-    //         if (n == 0) {
-    //             break;
-    //         }
-    //         for (buf, 0..) |b, i| {
-    //             if (i == buf.len - 1) {
-    //                 // print("END\n", .{});
-    //             }
-    //             if (b == '\n') {
-    //                 // print("{s}\n", .{buf[last_n + 1 .. i]});
-    //                 // try parseLine(&ln, buf[last_n + 1 .. i]);
-    //                 // last_n = i;
-    //                 //
-    //                 // const key = try allocator.dupe(u8, ln.name);
-    //                 //
-    //                 // const city = try city_map.getOrPut(key);
-    //                 // if (city.found_existing) {
-    //                 //     city.value_ptr.*.addItem(ln.temp);
-    //                 // } else {
-    //                 //     city.value_ptr.* = City{
-    //                 //         .min = ln.temp,
-    //                 //         .max = ln.temp,
-    //                 //         .sum = ln.temp,
-    //                 //         .count = 1,
-    //                 //     };
-    //                 // }
-    //                 // if (city.found_existing) {
-    //                 //     defer allocator.free(key);
-    //                 // }
-    //             }
-    //         }
-    //     } else |err| switch (err) {
-    //         else => return err, // Propagate error
-    //     }
-    // }
+            const key = try allocator.dupe(u8, ln.name);
 
-    while (reader.streamUntilDelimiter(writer, '\n', null)) : (line_no += 1) {
-        defer line.clearRetainingCapacity();
-        try parseLine(&ln, line.items);
-
-        const key = try allocator.dupe(u8, ln.name);
-
-        const city = try city_map.getOrPut(key);
-        if (city.found_existing) {
-            city.value_ptr.*.addItem(ln.temp);
-        } else {
-            city.value_ptr.* = City{
-                .min = ln.temp,
-                .max = ln.temp,
-                .sum = ln.temp,
-                .count = 1,
-            };
+            const city = try city_map.getOrPut(key);
+            if (city.found_existing) {
+                city.value_ptr.*.addItem(ln.temp);
+            } else {
+                city.value_ptr.* = City{
+                    .min = ln.temp,
+                    .max = ln.temp,
+                    .sum = ln.temp,
+                    .count = 1,
+                };
+            }
+            if (city.found_existing) {
+                defer allocator.free(key);
+            }
         }
-        if (city.found_existing) {
-            defer allocator.free(key);
-        }
-    } else |err| switch (err) {
-        error.EndOfStream => {}, // Continue on
-        else => return err, // Propagate error
     }
 
     const cities = try allocator.alloc([]const u8, city_map.count());
@@ -208,6 +170,10 @@ test "simpleFloatParse" {
     const testing = std.testing;
 
     try testing.expectEqual(1.2, try simpleFloatParse("1.2"));
+    try testing.expectEqual(-1.2, try simpleFloatParse("-1.2"));
+
+    try testing.expectEqual(10.23, try simpleFloatParse("10.23"));
+    try testing.expectEqual(-10.23, try simpleFloatParse("-10.23"));
 }
 
 test "parseLine" {

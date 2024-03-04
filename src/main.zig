@@ -8,12 +8,17 @@ pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     var arena = std.heap.ArenaAllocator.init(gpa.allocator());
+    var tsa = std.heap.ThreadSafeAllocator{
+        .child_allocator = arena.allocator(),
+    };
     defer arena.deinit();
-    const allocator = arena.allocator();
+    const allocator = tsa.allocator();
+
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
-    const file = try std.fs.cwd().openFile(args[1], .{ .mode = .read_only });
+    const file_name = args[1];
+    const file = try std.fs.cwd().openFile(file_name, .{ .mode = .read_only });
     defer file.close();
 
     const file_len: usize = std.math.cast(usize, try file.getEndPos()) orelse std.math.maxInt(usize);
@@ -28,19 +33,73 @@ pub fn main() !void {
     defer std.os.munmap(mapped_mem);
     try std.os.madvise(mapped_mem.ptr, file_len, std.os.MADV.HUGEPAGE);
 
-    var ln = try Line.init(allocator);
-    defer ln.deinit();
+    var pool: std.Thread.Pool = undefined;
+    try pool.init(std.Thread.Pool.Options{
+        .allocator = allocator,
+    });
+    var wg = std.Thread.WaitGroup{};
 
     var city_map = std.StringHashMap(City).init(allocator);
-    defer city_map.deinit();
+    var ctx = WorkerCtx{
+        .city_map = &city_map,
+    };
+    var main_lock = std.Thread.Mutex{};
+
+    var chunk_start: usize = 0;
+    const job_count = if (file_len < 1_000_000) 1 else try std.Thread.getCpuCount() - 1;
+    for (0..job_count) |i| {
+        const search_start = mapped_mem.len / job_count * (i + 1);
+        const chunk_end = std.mem.indexOfScalarPos(u8, mapped_mem, search_start, '\n') orelse mapped_mem.len;
+        wg.start();
+        try pool.spawn(threadRun, .{ allocator, mapped_mem[chunk_start..chunk_end], &ctx, &wg, &main_lock });
+        chunk_start = chunk_end + 1;
+        if (chunk_start >= mapped_mem.len) break;
+    }
+    wg.wait();
+
+    var cities = std.ArrayList([]const u8).init(allocator);
+    defer cities.deinit();
+
+    var iter = city_map.keyIterator();
+    while (iter.next()) |k| {
+        try cities.append(k.*);
+    }
+
+    std.mem.sortUnstable([]const u8, cities.items, {}, strLessThan);
+    for (cities.items) |c| {
+        if (c.len == 0) {
+            continue;
+        }
+        const city = city_map.get(c) orelse continue;
+        const count: f64 = @floatFromInt(city.count);
+        print("{s} min: {d}, max: {d}, avg: {d}\n", .{ c, city.min, city.max, city.sum / count });
+    }
+}
+const MAP_CAPACITY = 512 * 2 * 2;
+
+const WorkerCtx = struct {
+    city_map: *std.StringHashMap(City),
+};
+
+fn threadRun(
+    allocator: std.mem.Allocator,
+    mapped_mem: []u8,
+    ctx: *WorkerCtx,
+    wg: *std.Thread.WaitGroup,
+    lock: *std.Thread.Mutex,
+) void {
+    defer wg.finish();
+    var ln = try Line.init();
+    defer ln.deinit();
+    var city_map = std.StringHashMap(City).init(allocator);
 
     var last_n: u64 = 0;
     for (mapped_mem, 0..) |b, i| {
         if (b == '\n') {
-            try parseLine(&ln, mapped_mem[last_n..i]);
+            parseLine(&ln, mapped_mem[last_n..i]) catch break;
             const key = mapped_mem[last_n .. last_n + ln.name_length];
 
-            const city = try city_map.getOrPut(key);
+            const city = city_map.getOrPut(key) catch break;
             if (city.found_existing) {
                 city.value_ptr.*.addItem(ln.temp);
             } else {
@@ -56,22 +115,17 @@ pub fn main() !void {
         }
     }
 
-    const cities = try allocator.alloc([]const u8, city_map.count());
-    defer allocator.free(cities);
-
-    var iter = city_map.keyIterator();
-    var i: usize = 0;
-    while (iter.next()) |k| {
-        cities[i] = k.*;
-        i += 1;
+    var iter = city_map.iterator();
+    lock.lock();
+    while (iter.next()) |kv| {
+        const city = ctx.city_map.getOrPut(kv.key_ptr.*) catch return;
+        if (city.found_existing) {
+            city.value_ptr.*.merge(kv.value_ptr);
+        } else {
+            city.value_ptr.* = kv.value_ptr.*;
+        }
     }
-
-    std.mem.sortUnstable([]const u8, cities, {}, strLessThan);
-    for (cities) |c| {
-        const city = city_map.get(c) orelse continue;
-        const count: f64 = @floatFromInt(city.count);
-        print("{s} min: {d}, max: {d}, avg: {d}\n", .{ c, city.min, city.max, city.sum / count });
-    }
+    lock.unlock();
 }
 
 fn strLessThan(_: void, a: []const u8, b: []const u8) bool {
@@ -84,6 +138,13 @@ const City = struct {
     max: f64,
     sum: f64,
     count: i64,
+
+    pub fn merge(self: *Self, item: *Self) void {
+        self.min = @min(self.min, item.min);
+        self.max = @max(self.max, item.max);
+        self.sum += item.sum;
+        self.count += 1;
+    }
 
     pub fn addItem(self: *Self, item: f64) void {
         self.min = @min(self.min, item);
@@ -98,13 +159,11 @@ const Line = struct {
 
     name_length: usize,
     temp: f64,
-    allocator: std.mem.Allocator,
 
-    fn init(allocator: std.mem.Allocator) !Line {
+    fn init() !Line {
         return Line{
             .name_length = 0,
             .temp = 0,
-            .allocator = allocator,
         };
     }
 
@@ -115,26 +174,11 @@ const Line = struct {
 
 // This is missing input checking intentionally
 fn parseLine(ln: *Line, line: []const u8) !void {
-    var s = split(u8, line, ";");
-    var i: u8 = 0;
-    while (s.next()) |l| {
-        switch (i) {
-            0 => {
-                ln.name_length = l.len;
-            },
-            1 => {
-                const temp = try simpleFloatParse(l);
-                ln.temp = temp;
-            },
-            99 => break,
-            else => break,
-        }
-
-        i += 1;
-    }
+    const div = std.mem.indexOfScalarPos(u8, line, 0, ';') orelse line.len;
+    ln.name_length = div;
+    const temp = try simpleFloatParse(line[div..]);
+    ln.temp = temp;
 }
-
-const @"48": f64 = 48;
 
 fn simpleFloatParse(str: []const u8) !f64 {
     var v: i32 = 0;

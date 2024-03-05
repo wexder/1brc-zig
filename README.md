@@ -7,10 +7,8 @@ This is based on the challenge here: https://github.com/gunnarmorling/1brc/.
 
 I decided to implement this in Zig as a learning experience.
 
-# Baseline
+# Final result
 ```
-Executed in    5.76 secs    fish           external
-   usr time   37.81 secs  129.00 micros   37.81 secs
-   sys time   10.11 secs  526.00 micros   10.11 secs
+./zig-out/bin/1brc-zig measurements.txt  60.64s user 0.91s system 1014% cpu 6.067 total
 ```
 
